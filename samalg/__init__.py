@@ -288,8 +288,12 @@ class SAM(object):
             self.adata.layers["X_disp"].eliminate_zeros()
         else:
             self.adata.layers["X_disp"] = self.adata.X
-        self.adata.uns["preprocess_args"] = self.preprocess_args
 
+        mu,var = sf.mean_variance_axis(self.adata.X,axis=0)
+        self.adata.var['means'] = mu
+        self.adata.var['variances'] = var
+
+        self.adata.uns["preprocess_args"] = self.preprocess_args
     def get_avg_obsm(self, keym, keyl):
         clu = self.get_labels_un(keyl)
         cl = self.get_labels(keyl)
@@ -336,7 +340,7 @@ class SAM(object):
         transpose=True,
         save_sparse_file=None,
         sep=",",
-        calculate_avg=True,
+        calculate_avg=False,
         **kwargs
     ):
         """Loads the specified data file. The file can be a table of
@@ -364,7 +368,7 @@ class SAM(object):
             By default, assumes file is (genes x cells). Set this to False if
             the file has dimensions (cells x genes).
 
-        calculate_avg - bool, optional, default True
+        calculate_avg - bool, optional, default False
             If nearest neighbors are already calculated in the .h5ad file,
             setting this parameter to True performs knn averaging and stores
             the result in adata.layers['X_knn_avg']. This is a fairly dense
@@ -421,17 +425,19 @@ class SAM(object):
                 else:
                     self.adata.raw = None
 
-                if (
-                    "X_knn_avg" not in self.adata.layers.keys()
-                    and "neighbors" in self.adata.uns.keys()
-                    and calculate_avg
-                ):
-                    self.dispersion_ranking_NN()
             else:
                 self.adata_raw = self.adata
 
             if "X_disp" not in list(self.adata.layers.keys()):
                 self.adata.layers["X_disp"] = self.adata.X
+
+            if (
+                "X_knn_avg" not in self.adata.layers.keys()
+                and "neighbors" in self.adata.uns.keys()
+                and calculate_avg
+            ):
+                self.dispersion_ranking_NN()
+
             save_sparse_file = None
 
         if save_sparse_file is not None:
@@ -761,7 +767,8 @@ class SAM(object):
         f = nnm.sum(1).A
         f[f==0]=1
         D_avg = (nnm.multiply(1 / f)).dot(self.adata.layers["X_disp"])
-
+        #D_avg.data[D_avg.data<1]=0
+        #D_avg.eliminate_zeros()
         self.adata.layers["X_knn_avg"] = D_avg
 
         if sp.issparse(D_avg):
@@ -784,13 +791,9 @@ class SAM(object):
 
         weights = ((dispersions / dispersions.max()) ** 0.5).flatten()
 
-        self.adata.var["weights"] = weights
-
         all_gene_names = np.array(list(self.adata.var_names))
         indices = np.argsort(-weights)
         ranked_genes = all_gene_names[indices]
-        self.adata.uns["ranked_genes"] = ranked_genes
-
         return weights
 
     def calculate_regression_PCs(self, genes=None, npcs=None):
@@ -881,9 +884,9 @@ class SAM(object):
         weight_PCs=True,
         sparse_pca=False,
         proj_kwargs={},
-        project_weighted=True,
         seed = 0,
-        weight_mode='dispersion'
+        weight_mode='dispersion',
+        components = None,
     ):
         """Runs the Self-Assembling Manifold algorithm.
 
@@ -941,7 +944,14 @@ class SAM(object):
             A dictionary of keyword arguments to pass to the projection
             functions.
         """
+
+        if 'means' not in self.adata.var.keys() or 'variances' not in self.adata.var.keys():
+            mu,var = sf.mean_variance_axis(self.adata.X,axis=0)
+            self.adata.var['means'] = mu
+            self.adata.var['variances'] = var
+
         D = self.adata.X
+
         if k < 5:
             k = 5
         if k > D.shape[0] - 1:
@@ -974,7 +984,6 @@ class SAM(object):
             "weight_PCs": weight_PCs,
             "proj_kwargs": proj_kwargs,
             "sparse_pca": sparse_pca,
-            "project_weighted": project_weighted,
             "weight_mode": weight_mode,
             "seed": seed,
         }
@@ -1005,24 +1014,13 @@ class SAM(object):
 
         tinit = time.time()
         np.random.seed(seed)
-        edm = sp.coo_matrix((numcells, numcells), dtype="i").tolil()
-        nums = np.arange(edm.shape[1])
-        RINDS = np.random.randint(0, numcells, (k - 1) * numcells).reshape(
-            (numcells, (k - 1))
-        )
-        RINDS = np.hstack((nums[:, None], RINDS))
 
-        edm[
-            np.tile(np.arange(RINDS.shape[0])[:, None], (1, RINDS.shape[1])).flatten(),
-            RINDS.flatten(),
-        ] = 1
-        edm = edm.tocsr()
 
         if verbose:
             print("RUNNING SAM")
 
-        W = self.dispersion_ranking_NN(edm, weight_mode=weight_mode, num_norm_avg=1)
-
+        W = np.ones(self.adata.shape[1])
+        self.adata.var["weights"] = W
         old = np.zeros(W.size)
         new = W
 
@@ -1044,7 +1042,7 @@ class SAM(object):
             old = new
 
             W, wPCA_data, EDM, = self.calculate_nnm(
-                n_genes, preprocessing, npcs, nnas, weight_PCs, sparse_pca,project_weighted=project_weighted,weight_mode=weight_mode,seed=seed
+                n_genes, preprocessing, npcs, nnas, weight_PCs, sparse_pca,weight_mode=weight_mode,seed=seed,components=components,
             )
             new = W
             err = ((new - old) ** 2).mean() ** 0.5
@@ -1074,8 +1072,9 @@ class SAM(object):
             print("Elapsed time: " + str(elapsed) + " seconds")
 
     def calculate_nnm(
-        self, n_genes, preprocessing, npcs, num_norm_avg, weight_PCs, sparse_pca,
-        update_manifold=True,project_weighted=True,weight_mode='dispersion',seed=0
+        self, n_genes=None, preprocessing='StandardScaler', npcs=150, num_norm_avg=50, weight_PCs=True, sparse_pca=False,
+        update_manifold=True,weight_mode='dispersion',seed=0,
+        components = None
     ):
         numcells = self.adata.shape[0]
         D = self.adata.X
@@ -1102,12 +1101,18 @@ class SAM(object):
                 if sp.issparse(Ds):
                     Ds = Ds.toarray()
 
-                Ds = StandardScaler(with_mean=True).fit_transform(Ds)
+                v = self.adata.var['variances'].values[gkeep]
+                m = self.adata.var['means'].values[gkeep]
+                v[v==0]=1
+                Ds = (Ds - m)/v**0.5
+
                 Ds[Ds > 10] = 10
                 Ds[Ds < -10] = -10
             else:
                 Ds = D[:, gkeep]
-                Ds = StandardScaler(with_mean=False).fit_transform(Ds)
+                v = self.adata.var['variances'].values[gkeep]
+                v[v==0]=1
+                Ds = Ds.multiply(1/v**0.5).tocsr()
 
         else:
             Ds = D[:, gkeep].toarray()
@@ -1117,46 +1122,56 @@ class SAM(object):
         else:
             D_sub = Ds * (W[gkeep])
 
-        if not sparse_pca:
-            npcs = min(npcs, min((D.shape[0],gkeep.size)))
-            if numcells > 500:
-                g_weighted, pca = ut.weighted_PCA(
-                    D_sub,
-                    npcs=npcs,
-                    do_weight=weight_PCs,
-                    solver="auto",seed=seed
-                )
-            else:
-                g_weighted, pca = ut.weighted_PCA(
-                    D_sub,
-                    npcs=npcs,
-                    do_weight=weight_PCs,
-                    solver="full",seed=seed
-                )
-            self.pca_obj = pca
-            self.components = pca.components_
+        if components is None:
+            if not sparse_pca:
+                npcs = min(npcs, min((D.shape[0],gkeep.size)))
+                if numcells > 500:
+                    g_weighted, pca = ut.weighted_PCA(
+                        D_sub,
+                        npcs=npcs,
+                        do_weight=weight_PCs,
+                        solver="auto",seed=seed
+                    )
+                else:
+                    g_weighted, pca = ut.weighted_PCA(
+                        D_sub,
+                        npcs=npcs,
+                        do_weight=weight_PCs,
+                        solver="full",seed=seed
+                    )
+                self.pca_obj = pca
+                self.components = pca.components_
 
-            if not project_weighted:
-                g_weighted = (Ds-Ds.mean(0)).dot(pca.components_.T)
+            else:
+                npcs=min(npcs, min((D.shape[0],gkeep.size)) - 1)
+                v = self.adata.var['variances'].values[gkeep]
+                v[v==0]=1
+                m = self.adata.var['means'].values[gkeep]
+                output = ut._pca_with_sparse(D_sub, npcs,mu = (m/v**0.5)[None,:], seed = seed)
+                self.components = output['components']
+
+                g_weighted = output['X_pca']
+
                 if weight_PCs:
-                    ev = pca.explained_variance_
+                    ev = output['variance']
                     ev = ev / ev.max()
                     g_weighted = g_weighted * (ev ** 0.5)
-        else:
-            npcs=min(npcs, min((D.shape[0],gkeep.size)) - 1)
-            output = ut._pca_with_sparse(D_sub, npcs,seed = seed)
-            self.components = output['components']
-            g_weighted = output['X_pca']
-            if not project_weighted:
-                g_weighted = Ds.dot(self.components.T) - Ds.mean(0).A.flatten().dot(self.components.T)
 
+        else:
+            self.components = components[:,gkeep]
+            if sp.issparse(D_sub):
+                g_weighted = D_sub.dot(self.components.T) - D_sub.mean(0).A.flatten().dot(self.components.T)
+            else:
+                g_weighted = (D_sub-D_sub.mean(0)).dot(self.components.T)
             if weight_PCs:
-                ev = output['variance']
+                ev = g_weighted.var(0)
                 ev = ev / ev.max()
                 g_weighted = g_weighted * (ev ** 0.5)
 
         if distance == "euclidean":
-            g_weighted = Normalizer().fit_transform(g_weighted)
+            pass;#g_weighted = Normalizer().fit_transform(g_weighted)
+
+
 
         if update_manifold:
             edm = ut.calc_nnm(g_weighted, k, distance)
@@ -1174,6 +1189,10 @@ class SAM(object):
             else:
                 self.adata.uns['nnm'] = EDM
             W = self.dispersion_ranking_NN(EDM, weight_mode=weight_mode, num_norm_avg=num_norm_avg)
+
+
+
+            self.adata.var["weights"] = W
             self.adata.obsm["X_pca"] = g_weighted
             ge = np.array(list(self.adata.var_names[gkeep]))
             self.X_processed = (D_sub, ge, gkeep)
